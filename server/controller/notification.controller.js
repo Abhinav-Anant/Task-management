@@ -4,7 +4,7 @@ const { addClient } = require('../utils/sse.js');
 const { describe, mergePrefs } = require('../utils/notificationPrefs.js');
 const { whatsappEnabled } = require('../utils/whatsapp.js');
 const { emailEnabled } = require('../utils/email.js');
-const { isExpoToken } = require('../utils/push.js');
+const { isPushToken } = require('../utils/push.js');
 
 const HEARTBEAT_MS = 25000;
 
@@ -115,7 +115,7 @@ const updatePreferences = async (req, res) => {
 const registerPushToken = async (req, res) => {
     try {
         const token = String(req.body.token || "");
-        if (!isExpoToken(token)) return res.status(400).json({ message: "That is not an Expo push token" });
+        if (!isPushToken(token)) return res.status(400).json({ message: "That is not a push token" });
         // A device that changes hands must not keep buzzing for the previous owner.
         await User.updateMany({ _id: { $ne: req.user._id }, pushTokens: token }, { $pull: { pushTokens: token } });
         const user = await User.findById(req.user._id).select("pushTokens");

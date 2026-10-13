@@ -40,12 +40,11 @@ export const registerForPush = async () => {
         if (status !== 'granted') status = (await Notifications.requestPermissionsAsync()).status;
         if (status !== 'granted') return null;
 
+        // With an EAS project id: Expo's push service. Without: the raw Firebase token (google-services.json).
         const projectId = Constants.expoConfig?.extra?.eas?.projectId ?? Constants.easConfig?.projectId;
-        if (!projectId) {
-            console.warn('Push needs expo.extra.eas.projectId in app.json (run `eas init`).');
-            return null;
-        }
-        const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId });
+        const { data: token } = projectId
+            ? await Notifications.getExpoPushTokenAsync({ projectId })
+            : await Notifications.getDevicePushTokenAsync();
         await api.post(API_PATHS.PUSH_TOKEN, { token });
         await AsyncStorage.setItem(PUSH_KEY, token);
         return token;
