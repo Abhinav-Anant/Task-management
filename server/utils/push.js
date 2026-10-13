@@ -6,14 +6,43 @@ const EXPO_PUSH_URL = process.env.EXPO_PUSH_URL || 'https://exp.host/--/api/v2/p
 const TOKEN_RE = /^(Expo|Exponent)PushToken\[[^\]]+\]$/;
 
 const isExpoToken = (token) => TOKEN_RE.test(String(token || ''));
+// Raw Firebase (FCM) device token: "<id>:<long key>". Sent straight to Firebase, no Expo account involved.
+const isFcmToken = (token) => /^[\w-]+:[\w-]{100,}$/.test(String(token || ''));
+const isPushToken = (token) => isExpoToken(token) || isFcmToken(token);
+
+// FIREBASE_SERVICE_ACCOUNT = path to the service-account JSON. Unset = FCM tokens are skipped.
+let fcm;
+const getFcm = () => {
+    if (fcm !== undefined) return fcm;
+    if (!process.env.FIREBASE_SERVICE_ACCOUNT) return (fcm = null);
+    const admin = require('firebase-admin');
+    admin.initializeApp({ credential: admin.credential.cert(require(require('path').resolve(process.env.FIREBASE_SERVICE_ACCOUNT))) });
+    return (fcm = admin.messaging());
+};
+
+const sendFcm = async ({ userId, tokens, title, body, data }) => {
+    const messaging = getFcm();
+    if (!messaging || !tokens.length) return false;
+    const res = await messaging.sendEachForMulticast({
+        tokens,
+        notification: { title, body: String(body || '').slice(0, 300) },
+        // FCM data values must be strings.
+        data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [k, String(v)])),
+        android: { priority: 'high', notification: { channelId: 'default' } },
+    });
+    const dead = tokens.filter((_, i) => /registration-token-not-registered|invalid-registration-token|invalid-argument/.test(res.responses[i].error?.code || ''));
+    if (dead.length && userId) await User.updateOne({ _id: userId }, { $pull: { pushTokens: { $in: dead } } });
+    return true;
+};
 
 /**
  * Sends one notification to every device token of a user. Throws if Expo is unreachable (the job
  * retries); tokens Expo says are dead (DeviceNotRegistered) are pruned so we stop sending to them.
  */
 const sendPush = async ({ userId, tokens, title, body, data }) => {
+    const fcmSent = await sendFcm({ userId, tokens: (tokens || []).filter(isFcmToken), title, body, data });
     const valid = (tokens || []).filter(isExpoToken);
-    if (!valid.length) return false;
+    if (!valid.length) return fcmSent;
 
     const response = await fetch(EXPO_PUSH_URL, {
         method: 'POST',
@@ -33,4 +62,4 @@ const sendPush = async ({ userId, tokens, title, body, data }) => {
     return true;
 };
 
-module.exports = { sendPush, isExpoToken };
+module.exports = { sendPush, isExpoToken, isFcmToken, isPushToken };
