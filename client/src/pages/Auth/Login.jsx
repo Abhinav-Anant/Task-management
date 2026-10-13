@@ -95,6 +95,11 @@ const Login = () => {
               Create one
             </Link>
           </p>
+          <p className="text-sm text-mist mt-3">
+            <a className="text-signal hover:underline underline-offset-4" href="/download/task-manager.apk" download>
+              Download the Android app
+            </a>
+          </p>
         </form>
       </div>
     </AuthLayout>

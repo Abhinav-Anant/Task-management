@@ -1,5 +1,5 @@
 import React, { useContext, useEffect, useState } from 'react';
-import { LuSmartphone } from 'react-icons/lu';
+import { LuSmartphone, LuDownload } from 'react-icons/lu';
 import { UserContext } from '../../context/userContext';
 import { useNavigate } from 'react-router-dom';
 import { SIDE_MENU_DATA, SIDE_MENU_USER_DATA, SIDE_MENU_HEAD_DATA } from '../../utils/data';
@@ -126,6 +126,15 @@ const SideMenu = ({ activeMenu, onNavigate, variant = 'rail' }) => {
           );
         })}
       </ul>
+
+      <a
+        href="/download/task-manager.apk"
+        download
+        className="mx-3 mb-4 flex items-center gap-3.5 text-sm rounded-lg py-2.5 px-4 text-mist hover:text-beam hover:bg-white/5 transition-colors duration-200"
+      >
+        <LuDownload className="text-lg shrink-0" />
+        <span className="truncate">Android app</span>
+      </a>
     </nav>
   );
 };
