@@ -1,0 +1,36 @@
+# TODO — SOHO redesign
+
+- [x] Phase 1: security, file access, auth cookie, CORS
+- [x] Phase 1: one deployment per company (decided); signup closed; login throttle
+- [ ] Hide the /signup link on the login page when sign-up is closed
+- [x] Phase 2: task model (statuses, subtasks, dependencies, tags, watchers, activity)
+- [x] Task list pagination
+- [ ] Dashboard endpoints still load all of a user's tasks into memory (getUserDashboardData) - move to aggregation in Phase 4
+- [x] Phase 3: projects, project dashboard, project task filtering
+- [ ] Project member/manager notifications ("you were added to...") - engine is ready, just add the calls
+- [ ] Mobile: Projects tab (Phase 8)
+- [x] Phase 4: My Work, dashboards, time tracking, reminders, Quick Add
+- [x] Phase 5: Kanban, calendar, search, saved filters
+- [ ] Custom recurrence (spec item 21 lists Daily/Weekly/Monthly/Custom; only the first three exist)
+- [ ] Calendar: drag a task to a new day to reschedule (not in spec, skipped)
+- [ ] Mobile: Board and calendar views (Phase 8)
+- [x] Phase 6: notification engine + preferences (email via SMTP, Expo push, DB-backed job queue)
+- [x] Phase 7: task / employee / department / project reports + CSV and Excel export
+- [x] Phase 8: mobile (tasks, My Work, projects, calendar, notifications, push, camera/files)
+- [ ] Background jobs: replace `setInterval` reminders with a lock/queue (multi-instance safe)
+- [ ] S3 driver is untested against a real bucket
+- [ ] Push: add `expo.extra.eas.projectId` (run `eas init`) and test on a real device; registration is written but only tested up to the server
+- [ ] Comment attachments (spec item 9); comments have text, mentions, author and time today
+- [ ] Admin Settings area (spec item 31) should also host notification defaults; per-user settings live on the Profile page for now
+- [ ] Email is plain text; add an HTML template if you want branded mail
+- [ ] Live-test email against the real SMTP provider and push on a real device; both are only tested against fakes
+- [ ] Reports: per-day trend is on screen only (the file holds the five task numbers); add a second Excel sheet if people want it
+- [ ] Reports: department report reads tasks into memory (fine for thousands); switch to an aggregation if volumes grow
+- [ ] Mobile: offline mode (explicitly later in the spec)
+- [ ] Mobile: create projects, edit blocked-by, Kanban (web only for now)
+- [x] WhatsApp from each employee's own phone (QR / pairing code on Profile), member->head / head->admin / admin->anyone, admin broadcast
+- [ ] WhatsApp: live-test linking and sending against the real gateway with real phones (only the fake gateway is tested)
+- [ ] WhatsApp: each linked phone costs ~50-100 MB on the server; resize before linking more than ~10 people on 2 GB
+- [ ] Mobile: camera / photo / file pickers are written but were only tested in the browser build; try them on a phone
+- [ ] Attaching: PUT /api/tasks/:id (admin/head) still accepts any file URL; the new member endpoint checks ownership, the old path does not
+- [ ] Comment attachments (spec item 9), custom recurrence (spec item 21), admin Settings area (spec item 31)

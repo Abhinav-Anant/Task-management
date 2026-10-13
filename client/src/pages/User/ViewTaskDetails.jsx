@@ -1,246 +1,359 @@
-import React, { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import React, { useContext, useEffect, useState } from 'react'
+import { Link, useParams } from 'react-router-dom'
 import { API_PATHS } from '../../utils/apiPaths';
 import axiosInstance from '../../utils/axiosInstance';
 import DashboardLayout from '../../components/layouts/DashboardLayout';
 import moment from 'moment'
 import AvatarGroup from '../../components/layouts/AvatarGroup';
-import { LuSquareArrowUpRight } from 'react-icons/lu';
-
+import Progress from '../../components/layouts/Progress';
+import TaskComments from '../../components/TaskComments';
+import { categoryColor, statusChip, priorityChip, SETTABLE_STATUS_DATA } from '../../utils/data';
+import { TagChips, WaitingBanner, WatchButton, Subtasks, BlockedBy, ActivityTimeline, TimeTracker } from '../../components/TaskExtras';
+import { reminderLabel } from '../../utils/helper';
+import { LuPaperclip } from 'react-icons/lu';
+import { UserContext } from '../../context/userContext';
+import { LuSquareArrowUpRight, LuTriangleAlert, LuCheck, LuRepeat } from 'react-icons/lu';
+import toast from 'react-hot-toast';
 
 const ViewTaskDetails = () => {
   const { id } = useParams();
-
+  const { user } = useContext(UserContext);
   const [task, setTask] = useState(null);
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewing, setReviewing] = useState(false);
+  const [attaching, setAttaching] = useState(false);
 
-  const getStatusTagColor = (status) => {
-    switch (status) {
-      case "In Progress":
-        return "text-cyan-500 bg-cyan-50 border border-cyan-500/10"
-
-      case "Completed":
-        return "text-lime-500 bg-lime-50 border border-lime-500/20"
-
-      default:
-        return "text-violet-500 bg-violet-50 border border-violet-500/10"
-
-
+  // The server re-checks permission; canReview only decides whether to show the buttons.
+  const review = async (action) => {
+    setReviewing(true);
+    try {
+      const { data } = await axiosInstance.put(API_PATHS.TASKS.REVIEW_TASK(id), { action, note: reviewNote });
+      setTask({ ...data.task, canReview: task.canReview });
+      setReviewNote("");
+      toast.success(action === "approve" ? "Approved" : "Sent back");
+    } catch (error) {
+      toast.error(error.response?.data?.message || "That did not go through.");
+    } finally {
+      setReviewing(false);
     }
-  }
+  };
 
+  // Asking for Completed is enough: the server turns it into In Review when
+  // the task needs sign-off from someone else. Refetch because the status
+  // response is not populated.
+  const finish = async () => {
+    setReviewing(true);
+    try {
+      const { data } = await axiosInstance.put(API_PATHS.TASKS.UPDATE_TASK_STATUS(id), { status: "Completed" });
+      await getTaskDetailsById();
+      toast.success(data.updatedTask?.status === "In Review" ? "Submitted for review" : "Marked as done");
+    } catch (error) {
+      toast.error(error.response?.data?.message || "That did not go through.");
+    } finally {
+      setReviewing(false);
+    }
+  };
+
+  // Hand-set statuses (not Completed / In Review - those have their own buttons).
+  const setStatus = async (status) => {
+    try {
+      await axiosInstance.put(API_PATHS.TASKS.UPDATE_TASK_STATUS(id), { status });
+      await getTaskDetailsById();
+    } catch (error) {
+      toast.error(error.response?.data?.message || "That did not go through.");
+    }
+  };
+
+  // Pick files -> upload them -> attach them to this task. Anyone who can open the task may.
+  const addFiles = async (event) => {
+    const files = [...(event.target.files || [])];
+    event.target.value = '';
+    if (!files.length) return;
+    setAttaching(true);
+    try {
+      const form = new FormData();
+      files.forEach((file) => form.append('files', file));
+      const { data } = await axiosInstance.post(API_PATHS.TASKS.UPLOAD_ATTACHMENTS, form, {
+        headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120000,
+      });
+      const attached = await axiosInstance.post(API_PATHS.TASKS.ATTACH(id), { urls: data.urls });
+      setTask((prev) => ({ ...prev, attachments: attached.data.attachments }));
+      toast.success(files.length === 1 ? 'File added' : 'Files added');
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Could not add the file.');
+    } finally {
+      setAttaching(false);
+    }
+  };
 
   const getTaskDetailsById = async () => {
     try {
-      const response = await axiosInstance.get(
-        API_PATHS.TASKS.GET_TASK_BY_ID(id)
-      );
-
-
-      if (response.data) {
-        const taskInfo = response.data;
-        setTask(taskInfo)
-      }
-
-
+      const response = await axiosInstance.get(API_PATHS.TASKS.GET_TASK_BY_ID(id));
+      if (response.data) setTask(response.data)
     } catch (error) {
-      console.error("Error fetching user", error)
-
+      console.error("Error fetching task", error)
     }
-
   };
 
   const updateTodoChecklist = async (index) => {
-    const todoChecklist = [...task?.todoChecklist];
-    const taskId = id;
-    if (todoChecklist && todoChecklist[index]) {
-      todoChecklist[index].completed = !todoChecklist[index].completed;
+    const todoChecklist = [...(task?.todoChecklist || [])];
+    if (!todoChecklist[index]) return;
 
-      try {
-        const response = await axiosInstance.put(
-          API_PATHS.TASKS.UPDATE_TODO_CHECKLIST(taskId),
-          { todoChecklist }
-        );
-        if (response.status === 200) {
-          setTask(response.data?.task || task)
-        } else {
+    todoChecklist[index] = { ...todoChecklist[index], completed: !todoChecklist[index].completed };
 
-          todoChecklist[index].completed = !todoChecklist[index].completed;
-        }
-
-
-      } catch (error) {
-        todoChecklist[index].completed = !todoChecklist[index].completed;
-
-
+    try {
+      const response = await axiosInstance.put(
+        API_PATHS.TASKS.UPDATE_TODO_CHECKLIST(id),
+        { todoChecklist }
+      );
+      if (response.status === 200) {
+        setTask((prev) => ({ ...(response.data?.task || prev), canReview: prev.canReview }));
       }
+    } catch (error) {
+      console.error("Error updating checklist", error);
     }
-
-
   };
 
-  const handleClick = (link) => {
-    window.open(link, '_blank')
-  }
-
   useEffect(() => {
-    if (id) {
-      getTaskDetailsById()
-    }
-    return () => { }
+    if (id) getTaskDetailsById()
   }, [id])
 
+  const isOverdue = task && task.dueDate && !["Completed", "Cancelled"].includes(task.status) && moment(task.dueDate).isBefore(moment(), 'day');
+  const doneCount = (task?.todoChecklist || []).filter((t) => t.completed).length;
 
+  if (!task) {
+    return (
+      <DashboardLayout activeMenu="My Tasks">
+        <div className="py-6 space-y-4">
+          <div className="skeleton h-40" />
+          <div className="skeleton h-72" />
+        </div>
+      </DashboardLayout>
+    );
+  }
 
   return (
-    <DashboardLayout activeMenu='My Tasks'>
-      <div className='mt-5'>
-        {task && (<div className='grid grid-cols-1 md:grid-cols-4 mt-4'>
-          <div className='form-card col-span-3'>
-            <div className='flex items-center justify-around'>
-              <h2 className='text-base md:text-xl font-medium'>
-                {task?.title}
-              </h2>
-              <div className={`text-[11px] md:text-[13px] font-medium ${getStatusTagColor(
-                task?.status
-              )} px-4 py-0.5 rounded `}>
-                {task?.status}
-
-              </div>
-            </div>
-            <div className='mt-4'>
-              <InfoBox
-                label="Description"
-                value={task?.description}
-
-              />
-
-            </div>
-
-            <div className='grid grid-cols-12 gap-4 mt-4'>
-              <div className='col-span-6 md:col-span-4'>
-                <InfoBox
-                  label="Priority"
-                  value={task?.priority}
-                />
-              </div>
-              <div className='col-span-6 md:col-span-4'>
-                <InfoBox
-                  label="Due Date"
-                  value={task?.dueDate ?
-                    moment(task?.dueDate).format("Do MMM YYYY")
-                    : 'N/A'}
-
-                />
-              </div>
-              <div className='col-span-6 md:col-span-4'>
-                <label className='text-xs font-medium text-slate-500'>Assigned To </label>
-                <AvatarGroup
-                  avatars={
-                    task?.assignedTo?.map((item) => item?.profileImageUrl) || []
-
-                  }
-                  maxVisible={5}
-
-
-                />
+    <DashboardLayout activeMenu="My Tasks">
+      <div className="py-6 grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+        <div className="lg:col-span-2 space-y-4">
+          <div className="panel p-6 md:p-8">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <h2 className="font-display text-2xl text-beam leading-snug">{task.title}</h2>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <span className={`chip border ${categoryColor(task.category || 'General')}`}>
+                  {task.category || 'General'}
+                </span>
+                <span className={`chip ${statusChip(task.status)}`}>{task.status}</span>
+                {task.recurrence && task.recurrence !== "none" && (
+                  <span className="chip chip-mist flex items-center gap-1"><LuRepeat /> Repeats {task.recurrence}</span>
+                )}
               </div>
             </div>
 
-            <div className='mt-2'>
-              <label className='text-xs font-medium text-slate-500'>
-                Todo Checklist
-              </label>
-              {task?.todoChecklist?.map((item, index) => (
-                <TodoChecklist
-                  key={`todo_${index}`}
-                  text={item.text}
-                  isChecked={item?.completed}
-                  onChange={() => updateTodoChecklist(index)}
-                />
-              ))}
+            {(task.project || task.department) && (
+              <p className="text-xs text-dusk mt-3">
+                {task.project && <>Project: <Link to={`/projects/${task.project._id}`} className="text-signal hover:underline">{task.project.name}</Link></>}
+                {task.project && task.department && ' · '}
+                {task.department && <>Department: {task.department.name}</>}
+              </p>
+            )}
+
+            <WaitingBanner waitingFor={task.waitingFor} />
+
+            {task.description && (
+              <p className="text-sm text-mist leading-relaxed mt-4 whitespace-pre-wrap">
+                {task.description}
+              </p>
+            )}
+
+            <div className="mt-4"><TagChips tags={task.tags} /></div>
+
+            <div className="mt-8">
+              <div className="flex items-baseline justify-between mb-3">
+                <h3 className="font-display text-sm text-beam">Checklist</h3>
+                <span className="text-xs text-dusk num">
+                  {doneCount} of {task.todoChecklist?.length || 0} done
+                </span>
+              </div>
+
+              <ul className="space-y-1.5">
+                {task.todoChecklist?.map((item, index) => (
+                  <TodoChecklist
+                    key={item._id || `todo_${index}`}
+                    text={item.text}
+                    isChecked={item?.completed}
+                    onChange={() => updateTodoChecklist(index)}
+                  />
+                ))}
+                {(task.todoChecklist || []).length === 0 && (
+                  <li className="text-sm text-dusk">No checklist on this task.</li>
+                )}
+              </ul>
             </div>
 
-            {
-              task?.attachments?.length > 0 && (
-                <div className=''>
-                  <label className='text-xs font-medium text-slate-500'>
-                    Attachments
-                  </label>
-                  {task?.attachments?.map((link, index) => (
-                    <Attachment
-                      key={`link_${index}`}
-                      link={link}
-                      index={index}
-                      onClick={() => handleClick(link)}
+            <Subtasks task={task} onChange={(subtasks) => setTask((prev) => ({ ...prev, subtasks }))} />
 
+            <div className="mt-8">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-display text-sm text-beam">Attachments</h3>
+                <label className={`btn btn-sm cursor-pointer ${attaching ? 'opacity-60 pointer-events-none' : ''}`}>
+                  <LuPaperclip /> {attaching ? 'Uploading' : 'Add files'}
+                  <input type="file" multiple className="sr-only" onChange={addFiles} disabled={attaching} />
+                </label>
+              </div>
+              <div className="space-y-2">
+                {(task.attachments || []).map((link, index) => (
+                  <Attachment key={`link_${index}`} link={link} />
+                ))}
+                {!task.attachments?.length && <p className="text-sm text-dusk">No files yet.</p>}
+              </div>
+            </div>
 
-                    />
-                  ))}
+            <ActivityTimeline activity={task.activity} />
 
-                </div>
-              )
-            }
+            <TaskComments
+              taskId={id}
+              people={task.assignedTo || []}
+              comments={task.comments || []}
+              onChange={(comments) => setTask((prev) => ({ ...prev, comments }))}
+            />
           </div>
         </div>
 
-        )}
-      </div>
+        {/* Everything you check without reading: who, when, how far along. */}
+        <aside className="panel p-6 lg:sticky lg:top-[89px] space-y-6">
+          {task.status === "In Review" && task.canReview && (
+            <div className="space-y-3">
+              <label className="field-label" htmlFor="review-note">Waiting for your review</label>
+              <textarea
+                id="review-note"
+                className="field"
+                rows={3}
+                placeholder="Note for the assignee (sent with Send back)"
+                value={reviewNote}
+                onChange={({ target }) => setReviewNote(target.value)}
+              />
+              <div className="flex gap-2">
+                <button className="btn btn-primary" disabled={reviewing} onClick={() => review("approve")}>Approve</button>
+                <button className="btn" disabled={reviewing} onClick={() => review("reject")}>Send back</button>
+              </div>
+            </div>
+          )}
+          {task.status === "In Review" && !task.canReview && (
+            <p className="text-sm text-signal">Submitted. Waiting for approval.</p>
+          )}
+          <WatchButton
+            taskId={id}
+            isWatching={task.isWatching}
+            onChange={(isWatching) => setTask((prev) => ({ ...prev, isWatching }))}
+          />
+          {!["In Review", "Completed", "Cancelled"].includes(task.status) && (
+            <button className="btn btn-primary w-full" disabled={reviewing} onClick={finish}>
+              {task.requiresReview && !task.canReview ? "Submit for review" : "Mark as done"}
+            </button>
+          )}
 
+          {["To Do", "In Progress", "Blocked", "Cancelled"].includes(task.status) && (
+            <div>
+              <label className="field-label mb-2 block" htmlFor="task-status">Status</label>
+              <select id="task-status" className="field py-2" value={task.status} onChange={(e) => setStatus(e.target.value)}>
+                {SETTABLE_STATUS_DATA.map((s) => <option key={s.value} value={s.value}>{s.label}</option>)}
+              </select>
+            </div>
+          )}
+
+          <BlockedBy
+            task={task}
+            onChange={({ blockedBy, waitingFor }) => setTask((prev) => ({ ...prev, blockedBy, waitingFor }))}
+          />
+
+          <TimeTracker
+            task={task}
+            userId={user?._id}
+            isAdmin={user?.role === 'admin'}
+            onChange={(time) => setTask((prev) => ({ ...prev, ...time }))}
+          />
+
+          <div>
+            <p className="field-label mb-2">Progress</p>
+            <div className="flex items-baseline justify-between mb-2">
+              <span className="font-display text-2xl text-beam num">{task.progress || 0}%</span>
+            </div>
+            <Progress progress={task.progress || 0} status={task.status} />
+          </div>
+
+          <div>
+            <p className="field-label mb-2">Priority</p>
+            <span className={`chip ${priorityChip(task.priority)}`}>{task.priority}</span>
+          </div>
+
+          <div>
+            <p className="field-label mb-2">Due date</p>
+            <p className={`text-sm font-medium flex items-center gap-1.5 num ${isOverdue ? 'text-alert' : 'text-beam'}`}>
+              {isOverdue && <LuTriangleAlert className="shrink-0" />}
+              {task.dueDate ? moment(task.dueDate).format("D MMM YYYY") : 'Not set'}
+            </p>
+            {task.dueDate && <p className="text-xs text-dusk mt-1">Reminder: {reminderLabel(task.reminder)}</p>}
+            {isOverdue && (
+              <p className="text-xs text-alert/80 mt-1">
+                Overdue by {moment(task.dueDate).fromNow(true)}.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <p className="field-label mb-2">Assigned to</p>
+            <AvatarGroup
+              avatars={task.assignedTo?.map((item) => item?.profileImageUrl) || []}
+              maxVisible={5}
+            />
+          </div>
+        </aside>
+      </div>
     </DashboardLayout>
   )
 }
 
 export default ViewTaskDetails;
 
-
-
-
-
-const InfoBox = ({ label, value }) => {
-
-
-  return <>
-
-    <label className='text-xs font-medium text-slate-500'>{label} </label>
-    <p className='text-[12px] md:text-[13px] font-medium text-gray-700 mt-0.5  '>{value}</p>
-  </>
-}
-
-
-const TodoChecklist = ({ text, isChecked, onChange }) => {
-  return (
-    <div className="flex items-center gap-3 p-3">
+const TodoChecklist = ({ text, isChecked, onChange }) => (
+  <li>
+    <label className="flex items-center gap-3 panel-sunken rounded-lg px-3.5 py-2.5 cursor-pointer hover:bg-white/6 transition-colors">
       <input
         type="checkbox"
         checked={isChecked}
         onChange={onChange}
-        className='w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded-sm outline-none cursor-pointer '
+        className="sr-only peer"
       />
-      <p className='text-[13px] text-gray-800 '>{text}</p>
-    </div>
+      {/* A drawn box, so the tick lands in the app's own colours rather than
+          the browser's. */}
+      <span
+        aria-hidden="true"
+        className={`grid place-items-center w-[18px] h-[18px] shrink-0 rounded border transition-colors ${
+          isChecked ? 'bg-done border-done text-ink' : 'border-white/25 text-transparent'
+        } peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-signal peer-focus-visible:outline-offset-2`}
+      >
+        <LuCheck className="text-[13px]" />
+      </span>
+      <span className={`text-sm ${isChecked ? 'text-dusk line-through' : 'text-beam'}`}>{text}</span>
+    </label>
+  </li>
+);
+
+const Attachment = ({ link }) => {
+  const name = decodeURIComponent(link.split("/").pop() || link).replace(/^\d{10,}-/, "");
+
+  return (
+    <a
+      href={link}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="flex items-center justify-between gap-3 panel-sunken rounded-lg px-3.5 py-2.5 hover:bg-white/6 transition-colors group"
+    >
+      <p className="text-sm text-beam truncate group-hover:text-signal transition-colors" title={link}>
+        {name}
+      </p>
+      <LuSquareArrowUpRight className="text-dusk shrink-0" />
+    </a>
   );
 };
-
-
-const Attachment = ({ link, index, onClick }) => {
-
-
-
-
-  return <div
-    className='flex justify-between bg-gray-50 border border-gray-100 px-3 py-2 rounded-md mb-3 mt-2 cursor-pointer '
-    onClick={onClick}
-  >
-    <div className='flex-1 flex items-center gap-3 '>
-      <span className='text-xs text-gray-400 font-semibold mr-2'>
-        {index < 9 ? `0${index + 1}` : index + 1}
-      </span>
-      <p className='text-xs text-black '>
-        {link}
-      </p>
-    </div>
-    <LuSquareArrowUpRight className='text-gray-400 ' />
-
-  </div>
-}
-

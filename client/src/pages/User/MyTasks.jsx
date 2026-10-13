@@ -1,93 +1,70 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import DashboardLayout from '../../components/layouts/DashboardLayout';
 import { useNavigate } from 'react-router-dom';
-import axiosInstance from '../../utils/axiosInstance';
-import { API_PATHS } from '../../utils/apiPaths';
 import TaskStatusTab from '../../components/layouts/TaskStatusTab';
 import TaskCard from '../../components/Cards/TaskCard';
-import toast from 'react-hot-toast';
+import TaskFilters from '../../components/TaskFilters';
+import useTaskList from '../../hooks/useTaskList';
+import Pager from '../../components/Pager';
+import { LuInbox } from 'react-icons/lu';
 
 const MyTasks = () => {
-  const [allTasks, setAllTasks] = useState([]);
-  const [tabs, setTabs] = useState([]);
-  const [filterStatus, setFilterStatus] = useState('All');
+  const { tasks, tabs, categories, tags, projects, status, setStatus, filters, setFilters, loading, page, setPage, pagination } = useTaskList();
   const navigate = useNavigate();
 
-  useEffect(() => {
-    const getAllTasks = async () => {
-      try {
-        const { data } = await axiosInstance.get(API_PATHS.TASKS.GET_ALL_TASKS, {
-          params: {
-            status: filterStatus === 'All' ? '' : filterStatus,
-          },
-        });
-
-        const tasks = data?.tasks || [];
-        const statusSummary = data?.statusSummary || {};
-
-        setAllTasks(tasks);
-
-        const statusArray = [
-          { label: 'All', count: statusSummary.all || 0 },
-          { label: 'Pending', count: statusSummary.pendingTasks || 0 },
-          { label: 'In Progress', count: statusSummary.inProgressTasks || 0 },
-          { label: 'Completed', count: statusSummary.completedTasks || 0 },
-        ];
-
-        setTabs(statusArray);
-      } catch (error) {
-        console.error('Error fetching tasks:', error);
-        toast.error('Failed to fetch tasks.');
-      }
-    };
-
-    getAllTasks();
-  }, [filterStatus]);
-
   const handleClick = (taskId) => {
-    if (taskId) navigate(`/user/task-details/${taskId}`);
+    if (taskId) navigate(`/user/task-details/${taskId}`, { viewTransition: true });
   };
 
   return (
     <DashboardLayout activeMenu="My Tasks">
-      <div className="my-5">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between">
-          <h2 className="text-xl font-medium">My Tasks</h2>
-
-          {tabs.length > 0 && (
-            <TaskStatusTab
-              tabs={tabs}
-              activeTab={filterStatus}
-              setActiveTab={setFilterStatus}
-            />
-          )}
+      <div className="py-6">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <h2 className="font-display text-2xl text-beam">My tasks</h2>
+          <TaskStatusTab tabs={tabs} activeTab={status} setActiveTab={setStatus} />
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-          {allTasks.length > 0 ? (
-            allTasks.map((task) => (
+        <TaskFilters filters={filters} setFilters={setFilters} categories={categories} tags={tags} projects={projects} />
+
+        {loading ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
+            {[0, 1, 2, 3, 4, 5].map((i) => <div key={i} className="skeleton h-64" />)}
+          </div>
+        ) : tasks.length > 0 ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
+            {tasks.map((task) => (
               <TaskCard
                 key={task._id}
                 title={task.title}
                 description={task.description}
                 priority={task.priority}
                 status={task.status}
+                category={task.category}
                 progress={task.progress}
                 createdAt={task.createdAt}
                 dueDate={task.dueDate}
                 assignedTo={(task.assignedTo || []).map((a) => a.profileImageUrl)}
                 attachmentCount={task.attachments?.length || 0}
+                commentCount={task.comments?.length || 0}
                 completedTodoCount={task.completedTodoCount || 0}
+                tags={task.tags}
+                waitingFor={task.waitingFor}
                 todoChecklist={task.todoChecklist || []}
                 onClick={() => handleClick(task._id)}
               />
-            ))
-          ) : (
-            <p className="text-gray-500 col-span-full text-center mt-10">
-              No tasks found.
+            ))}
+          </div>
+        ) : (
+          <div className="panel p-12 mt-4 text-center">
+            <LuInbox className="text-3xl text-dusk mx-auto" />
+            <p className="text-beam mt-4">Nothing here right now.</p>
+            <p className="text-sm text-mist mt-1">
+              Clear the filters above, or check another status tab.
             </p>
-          )}
-        </div>
+          </div>
+        )}
+
+        <Pager page={page} pages={pagination.pages} total={pagination.total} onChange={setPage} />
       </div>
     </DashboardLayout>
   );

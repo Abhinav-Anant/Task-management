@@ -1,224 +1,347 @@
-const express = require("express");
+const mongoose = require('mongoose');
 const Task = require('../model/task.model.js');
 const User = require('../model/user.model.js');
+const { notify } = require('../utils/notify.js');
+const { scopeFor, canAccessTask, canAssignTo, canReview, departmentHeadsOf, departmentMemberIds, headedDepartmentIds } = require('../utils/scope.js');
+const { RECURRENCES, nextDueDate } = require('../utils/recurrence.js');
+const { OPEN, STATUSES, PRIORITIES, PRIORITY_ORDER } = require('../utils/taskStatus.js');
+const { logActivity, logStatusChange } = require('../utils/activity.js');
+const { normalizeTags, openBlockers, waitingForByTask } = require('../utils/taskLinks.js');
+const Project = require('../model/project.model.js');
+const Department = require('../model/department.model.js');
+const { canViewProject } = require('../utils/projectScope.js');
+const { dayBounds, reminderError, computeRemindAt } = require('../utils/workTime.js');
 
+const SORTABLE_FIELDS = ["dueDate", "createdAt", "updatedAt", "completedAt", "priority", "progress", "title"];
 
-// const getDashboardData = async (req, res) => {
-//     try {
-//         // Check if the user is an admin
-//         if (req.user.role !== 'admin') {
-//             return res.status(403).json({ message: "Unauthorized access" });
-//         }
+const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-//         // Get the total count of tasks (all tasks)
-//         const allTasksCount = await Task.countDocuments();
+/**
+ * Builds the Mongo filter from the query string.
+ * Takes an already-resolved `scope` (from utils/scope.js) rather than the user, so
+ * this stays a pure, synchronous function - resolving a head's department members
+ * needs a database round trip and belongs at the call site.
+ * Returns `base` (everything except status) so the status tab counts stay
+ * consistent with the other active filters.
+ */
+const buildFilters = (scope, query) => {
+    const { status, priority, category, tag, project, department, assignee, open, search, dueBefore, dueAfter, overdue } = query;
+    const base = { ...scope };
 
-//         // Get task count by status
-//         const pendingTasksCount = await Task.countDocuments({ status: 'Pending' });
-//         const inProgressTasksCount = await Task.countDocuments({ status: 'In Progress' });
-//         const completedTasksCount = await Task.countDocuments({ status: 'Completed' });
+    if (priority && priority.trim()) base.priority = priority.trim();
+    if (category && category.trim()) base.category = category.trim();
+    if (tag && tag.trim()) base.tags = normalizeTags([tag])[0];
+    // A malformed id matches nothing rather than blowing up the cast.
+    if (project && project.trim()) base.project = mongoose.isValidObjectId(project) ? project : { $in: [] };
+    // An employee's own tasks, on top of whatever the caller's scope already allows.
+    if (assignee && assignee.trim()) {
+        base.$and = [...(base.$and || []), { assignedTo: mongoose.isValidObjectId(assignee) ? new mongoose.Types.ObjectId(assignee) : { $in: [] } }];
+    }
+    if (open === "true") base.status = OPEN;
+    if (department && department.trim()) base.department = mongoose.isValidObjectId(department) ? department : { $in: [] };
 
-//         // Get the number of users (you can use specific filters if necessary, like active users)
-//         const allUsersCount = await User.countDocuments();
+    if ((dueBefore && dueBefore.trim()) || (dueAfter && dueAfter.trim())) {
+        base.dueDate = {};
+        if (dueAfter && dueAfter.trim()) base.dueDate.$gte = new Date(dueAfter);
+        if (dueBefore && dueBefore.trim()) base.dueDate.$lte = new Date(dueBefore);
+    }
 
-//         // You could also add additional statistics, such as users with assigned tasks, or average number of tasks per user
-//         const usersWithTasksCount = await User.countDocuments({ tasks: { $gte: 1 } });
+    if (overdue === "true") {
+        base.dueDate = { ...(base.dueDate || {}), $lt: new Date() };
+        base.status = OPEN;
+    }
 
-//         // Collect the data into a summary object
-//         const dashboardSummary = {
-//             allTasksCount,
-//             pendingTasksCount,
-//             inProgressTasksCount,
-//             completedTasksCount,
-//             allUsersCount,
-//             usersWithTasksCount
-//         };
+    if (search && search.trim()) {
+        const rx = new RegExp(escapeRegex(search.trim()), "i");
+        base.$or = [{ title: rx }, { description: rx }];
+    }
 
-//         // Respond with the dashboard data
-//         res.json({
-//             message: "Dashboard data retrieved successfully",
-//             data: dashboardSummary
-//         });
-//     } catch (error) {
-//         res.status(500).json({ message: "Server error", error: error.message });
-//     }
-// };
+    const filter = { ...base };
+    if (status && status.trim() && status !== "All") {
+        const wanted = status.trim();
+        // The base filter may already exclude this status (overdue implies "not Completed").
+        // Asking for it anyway must return nothing, not silently drop the exclusion.
+        filter.status = base.status?.$nin?.includes(wanted) ? { $in: [] } : wanted;
+    }
 
+    return { base, filter };
+};
 
+const DEFAULT_PAGE_SIZE = 25;
+const MAX_PAGE_SIZE = 500; // the calendar asks for a whole month grid in one go
 
+const pageParams = (query) => ({
+    page: Math.max(1, parseInt(query.page, 10) || 1),
+    limit: Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(query.limit, 10) || DEFAULT_PAGE_SIZE)),
+});
 
-// const getUserDashboardData = async (req, res) => {
-//     try {
-//         // Get tasks assigned to the logged-in user
-//         const assignedTasks = await Task.find({ assignedTo: req.user._id })
-//             .populate("assignedTo", "name email profileImageUrl");
+const buildSort = (query) => {
+    const field = SORTABLE_FIELDS.includes(query.sortBy) ? query.sortBy : "createdAt";
+    const order = query.sortOrder === "asc" ? 1 : -1;
+    return { [field]: order };
+};
 
-//         if (!assignedTasks) {
-//             return res.status(404).json({ message: "No tasks found for this user" });
-//         }
+const withCompletedCount = (task) => {
+    const doc = typeof task.toObject === "function" ? task.toObject() : task;
+    return {
+        ...doc,
+        completedTodoCount: (doc.todoChecklist || []).filter((item) => item.completed).length,
+    };
+};
 
-//         // Get task counts by status for the user
-//         const pendingTasksCount = await Task.countDocuments({
-//             assignedTo: req.user._id,
-//             status: "Pending"
-//         });
+/** Everyone who should hear about a change to this task. */
+const watchersOf = (task) => [...(task.assignedTo || []), ...(task.createdBy || []), ...(task.watchers || [])];
 
-//         const inProgressTasksCount = await Task.countDocuments({
-//             assignedTo: req.user._id,
-//             status: "In Progress"
-//         });
+/**
+ * Completion is the one event that escalates past the people directly on the task:
+ * the assignees' department heads and every admin are copied too, so a head hears
+ * about their own department's work even on a task an admin created and assigned.
+ * notify() de-duplicates and drops the actor, so overlap with watchersOf is free.
+ */
+const completionWatchers = async (task) => {
+    const admins = await User.find({ role: "admin" }).select("_id").lean();
+    return [
+        ...watchersOf(task),
+        ...admins.map((admin) => admin._id),
+        ...await departmentHeadsOf(task.assignedTo),
+    ];
+};
 
-//         const completedTasksCount = await Task.countDocuments({
-//             assignedTo: req.user._id,
-//             status: "Completed"
-//         });
+// What a client may ask for. In Review is the server's answer to "Completed"
+// on a task that needs sign-off, never a request.
+const REQUESTABLE_STATUSES = ["To Do", "In Progress", "Blocked", "Completed", "Cancelled"];
 
-//         // Add completed todo checklist count to each task (optional)
-//         const tasksWithCompletion = await Promise.all(
-//             assignedTasks.map(async (task) => {
-//                 const completedCount = task.todoChecklist.filter(
-//                     (item) => item.completed
-//                 ).length;
-//                 return { ...task._doc, completedTodoCount: completedCount };
-//             })
-//         );
+/** Whoever can sign off this task: its creator and the assignees' heads. */
+const reviewersOf = async (task) => [
+    ...(task.createdBy || []),
+    ...await departmentHeadsOf(task.assignedTo),
+];
 
-//         // Prepare the user dashboard data
-//         const userDashboardData = {
-//             tasks: tasksWithCompletion, // All tasks assigned to the user, with their completion counts
-//             statusSummary: {
-//                 pendingTasks: pendingTasksCount,
-//                 inProgressTasks: inProgressTasksCount,
-//                 completedTasks: completedTasksCount
-//             }
-//         };
+/** Ticks everything and stamps completion. Every path into Completed goes through here. */
+const markCompleted = (task) => {
+    task.todoChecklist.forEach((item) => { item.completed = true; });
+    task.progress = 100;
+    task.status = "Completed";
+    task.completedAt = task.completedAt || new Date();
+};
 
-//         // Respond with the user-specific dashboard data
-//         res.json({
-//             message: "User dashboard data retrieved successfully",
-//             data: userDashboardData
-//         });
-//     } catch (error) {
-//         res.status(500).json({ message: "Server error", error: error.message });
-//     }
-// };
+/**
+ * Creates the next copy of a recurring task, at most once per task.
+ * The conditional update claims the slot before the copy exists, so two
+ * completions racing each other cannot both spawn.
+ */
+const spawnNext = async (task) => {
+    if (!task.recurrence || task.recurrence === "none" || task.nextTask || !task.dueDate) return null;
+
+    const nextId = new mongoose.Types.ObjectId();
+    const claim = await Task.updateOne({ _id: task._id, nextTask: null }, { $set: { nextTask: nextId } });
+    if (!claim.modifiedCount) return null;
+    task.nextTask = nextId;
+
+    let next;
+    try {
+        next = await Task.create({
+            _id: nextId,
+            title: task.title,
+            description: task.description,
+            category: task.category,
+            priority: task.priority,
+            tags: task.tags,
+            watchers: task.watchers,
+            dueDate: nextDueDate(task.dueDate, task.recurrence),
+            reminder: task.reminder,
+            remindAt: computeRemindAt(nextDueDate(task.dueDate, task.recurrence), task.reminder),
+            estimatedMinutes: task.estimatedMinutes,
+            assignedTo: task.assignedTo,
+            createdBy: task.createdBy,
+            attachments: task.attachments,
+            todoChecklist: task.todoChecklist.map((item) => ({ text: item.text, completed: false })),
+            requiresReview: task.requiresReview,
+            recurrence: task.recurrence,
+        });
+    } catch (error) {
+        // The claim above already marked this task as spawned - release it so a
+        // failed create here doesn't permanently block the recurrence.
+        await Task.updateOne({ _id: task._id, nextTask: nextId }, { $set: { nextTask: null } });
+        task.nextTask = null;
+        throw error;
+    }
+
+    // No actor: the person who completed the last one still needs to hear about the next.
+    await notify({
+        userIds: next.assignedTo,
+        type: "assigned",
+        task: next._id,
+        title: `New task: ${next.title}`,
+        message: `"${next.title}" repeats ${next.recurrence}; the next one is due ${new Date(next.dueDate).toDateString()}.`,
+    });
+    return next;
+};
+
+/** Alerts (and the recurring spawn) for a status transition that has already been saved. */
+const afterStatusChange = async (task, previousStatus, actor, { approved = false } = {}) => {
+    if (previousStatus === task.status) return;
+
+    if (task.status === "Completed") {
+        await spawnNext(task);
+        const everyone = await completionWatchers(task);
+        const assignees = new Set((task.assignedTo || []).map(String));
+        // An approval is news of its own to the people who did the work; the rest still get "completed".
+        if (approved) {
+            await notify({
+                userIds: [...assignees],
+                actor,
+                type: "approved",
+                task: task._id,
+                title: `Approved: ${task.title}`,
+                message: `${actor.name} approved "${task.title}". It is done.`,
+            });
+        }
+        await notify({
+            userIds: approved ? everyone.filter((id) => !assignees.has(String(id))) : everyone,
+            actor,
+            type: "status",
+            event: "completed",
+            task: task._id,
+            title: `${task.title} is now Completed`,
+            message: `${actor.name} moved "${task.title}" from ${previousStatus} to Completed.`,
+        });
+    } else if (task.status === "Blocked") {
+        await notify({
+            userIds: watchersOf(task),
+            actor,
+            type: "blocked",
+            task: task._id,
+            title: `Blocked: ${task.title}`,
+            message: `${actor.name} marked "${task.title}" as blocked.`,
+        });
+    } else if (task.status === "In Review") {
+        await notify({
+            userIds: await reviewersOf(task),
+            actor,
+            type: "review",
+            task: task._id,
+            title: `Review: ${task.title}`,
+            message: `${actor.name} finished "${task.title}" and it is waiting for your approval.`,
+        });
+    } else {
+        await notify({
+            userIds: watchersOf(task),
+            actor,
+            type: "status",
+            task: task._id,
+            title: `${task.title} is now ${task.status}`,
+            message: `${actor.name} moved "${task.title}" from ${previousStatus} to ${task.status}.`,
+        });
+    }
+};
+
+/**
+ * A task may only point at a project the caller can see and a department that exists.
+ * Returns { status, message } to refuse, or null. undefined/null/"" means "not setting / clearing".
+ */
+const checkLinks = async (user, { project, department }) => {
+    if (project) {
+        const found = mongoose.isValidObjectId(project) ? await Project.findById(project).select("_id") : null;
+        if (!found || !(await canViewProject(user, found))) return { status: 404, message: "Project not found" };
+    }
+    if (department && (!mongoose.isValidObjectId(department) || !(await Department.exists({ _id: department })))) {
+        return { status: 404, message: "Department not found" };
+    }
+    return null;
+};
+
+/** ", due Mon Jan 01 2026" or nothing, for tasks without a due date. */
+const dueText = (task) => (task.dueDate ? `, due ${new Date(task.dueDate).toDateString()}` : "");
+
+const populateTask = (id) => Task.findById(id)
+    .populate("assignedTo", "name email profileImageUrl")
+    .populate("comments.user", "name email profileImageUrl");
 
 const getDashboardData = async (req, res) => {
     try {
-        // Only admins are allowed to view dashboard data
-        if (req.user.role !== 'admin') {
+        if (!["admin", "head"].includes(req.user.role)) {
             return res.status(403).json({ message: "Unauthorized access" });
         }
 
-        // Run all count queries in parallel to optimize performance
+        // Every figure on this dashboard is scoped: a head sees their own
+        // department's numbers only, never an org-wide total.
+        const scope = await scopeFor(req.user);
+        const led = headedDepartmentIds(req.user);
+        const memberIds = led.length ? await departmentMemberIds(led) : null;
+        const userFilter = memberIds ? { _id: { $in: memberIds } } : {};
+
         const [
             allTasksCount,
             pendingTasksCount,
             inProgressTasksCount,
+            inReviewTasksCount,
             completedTasksCount,
+            overdueTasksCount,
             allUsersCount,
-            usersWithTasksCount
-        ] = await Promise.all([  // **Optimized the queries by running them in parallel**
-            Task.countDocuments(),
-            Task.countDocuments({ status: 'Pending' }),
-            Task.countDocuments({ status: 'In Progress' }),
-            Task.countDocuments({ status: 'Completed' }),
-            User.countDocuments(),
-            User.countDocuments({ tasks: { $exists: true, $not: { $size: 0 } } })  // **Updated to check if 'tasks' field exists and is not an empty array**
+            assignedUserIds,
+        ] = await Promise.all([
+            Task.countDocuments(scope),
+            Task.countDocuments({ ...scope, status: 'To Do' }),
+            Task.countDocuments({ ...scope, status: 'In Progress' }),
+            Task.countDocuments({ ...scope, status: 'In Review' }),
+            Task.countDocuments({ ...scope, status: 'Completed' }),
+            Task.countDocuments({ ...scope, status: OPEN, dueDate: { $lt: new Date() } }),
+            User.countDocuments(userFilter),
+            Task.distinct("assignedTo", scope),
         ]);
 
-        // Calculate additional stats (optional)
-        const tasksPerUserAvg = allUsersCount ? allTasksCount / allUsersCount : 0;  // **Newly added: Calculated the average number of tasks per user**
-
-        // Collect the data into a summary object
-        const dashboardSummary = {
-            allTasksCount,
-            pendingTasksCount,
-            inProgressTasksCount,
-            completedTasksCount,
-            allUsersCount,
-            usersWithTasksCount,
-            tasksPerUserAvg  // **Included tasksPerUserAvg in the response**
-        };
-
-        // Respond with the dashboard data
         res.status(200).json({
             message: "Dashboard data retrieved successfully",
-            data: dashboardSummary
+            data: {
+                allTasksCount,
+                pendingTasksCount,
+                inProgressTasksCount,
+                inReviewTasksCount,
+                completedTasksCount,
+                overdueTasksCount,
+                allUsersCount,
+                usersWithTasksCount: assignedUserIds.length,
+                tasksPerUserAvg: allUsersCount ? allTasksCount / allUsersCount : 0,
+            },
         });
     } catch (error) {
-        // Handle server errors
         res.status(500).json({ message: "Server error", error: error.message });
     }
 };
 
-
 const getUserDashboardData = async (req, res) => {
     try {
-        // Get all tasks assigned to logged-in user
-        const assignedTasks = await Task.find({ assignedTo: req.user._id })
-            .populate("assignedTo", "name email profileImageUrl");
+        const mine = { assignedTo: req.user._id };
 
-        if (assignedTasks.length === 0) {
-            return res.status(404).json({ message: "No tasks found for this user" });
-        }
-
-        // Aggregate task statuses
-        const statusCounts = await Task.aggregate([
-            { $match: { assignedTo: req.user._id } },
-            { $group: { _id: "$status", count: { $sum: 1 } } },
+        // Counts and a short recent list in the database - never the whole task set.
+        const [statusGroups, priorityGroups, overdueTasks, recent] = await Promise.all([
+            Task.aggregate([{ $match: mine }, { $group: { _id: "$status", count: { $sum: 1 } } }]),
+            Task.aggregate([{ $match: mine }, { $group: { _id: "$priority", count: { $sum: 1 } } }]),
+            Task.countDocuments({ ...mine, status: OPEN, dueDate: { $lt: dayBounds(parseInt(req.query.tzOffset, 10) || 0).start } }),
+            Task.find(mine).sort({ dueDate: 1, _id: 1 }).limit(10).select("-activity").populate("assignedTo", "name email profileImageUrl"),
         ]);
 
+        const byStatus = Object.fromEntries(statusGroups.map((g) => [g._id, g.count]));
         const statusSummary = {
-            Pending: 0,
-            InProgress: 0,
-            Completed: 0,
+            Pending: byStatus["To Do"] || 0,
+            InProgress: byStatus["In Progress"] || 0,
+            InReview: byStatus["In Review"] || 0,
+            Completed: byStatus["Completed"] || 0,
         };
-
-        statusCounts.forEach(({ _id, count }) => {
-            if (_id === "Pending") statusSummary.Pending = count;
-            else if (_id === "In Progress") statusSummary.InProgress = count;
-            else if (_id === "Completed") statusSummary.Completed = count;
-        });
-
-        // Aggregate task priorities
-        const priorityCounts = await Task.aggregate([
-            { $match: { assignedTo: req.user._id } },
-            { $group: { _id: "$priority", count: { $sum: 1 } } },
-        ]);
-
-        const prioritySummary = {
-            Low: 0,
-            Medium: 0,
-            High: 0,
-        };
-
-        priorityCounts.forEach(({ _id, count }) => {
-            if (_id === "Low") prioritySummary.Low = count;
-            else if (_id === "Medium") prioritySummary.Medium = count;
-            else if (_id === "High") prioritySummary.High = count;
-        });
-
-        // Add completed checklist count to tasks
-        const tasksWithCompletion = assignedTasks.map(task => {
-            const completedTodoCount = task.todoChecklist.filter(item => item.completed).length;
-            return { ...task.toObject(), completedTodoCount };
-        });
-
-        const userDashboardData = {
-            charts: {
-                taskDistribution: {
-                    All: assignedTasks.length,
-                    ...statusSummary,
-                },
-                taskPriorityLevels: prioritySummary,
-            },
-            recentTasks: tasksWithCompletion.slice(0, 10), // limit recent tasks to 10
-        };
+        const prioritySummary = { Low: 0, Medium: 0, High: 0, Urgent: 0 };
+        priorityGroups.forEach((g) => { if (prioritySummary[g._id] !== undefined) prioritySummary[g._id] = g.count; });
 
         return res.json({
             message: "User dashboard data retrieved successfully",
-            data: userDashboardData,
+            data: {
+                charts: {
+                    taskDistribution: { All: statusGroups.reduce((n, g) => n + g.count, 0), ...statusSummary },
+                    taskPriorityLevels: prioritySummary,
+                },
+                overdueTasks,
+                recentTasks: recent.map(withCompletedCount),
+            },
         });
     } catch (error) {
         console.error("Error in getUserDashboardData:", error);
@@ -226,156 +349,450 @@ const getUserDashboardData = async (req, res) => {
     }
 };
 
-
-
-// Get all tasks(Admin:all, user:only assigned)
-
-
+// Get all tasks (Admin: all, User: only assigned) with search, filtering and sorting.
 const getTasks = async (req, res) => {
     try {
-        const { status } = req.query;
-        let filter = {};
+        // mine=true is "My Work": only tasks assigned to me, even for a head or admin whose scope is wider.
+        const scope = req.query.mine === "true" ? { assignedTo: req.user._id } : await scopeFor(req.user);
+        const { base, filter } = buildFilters(scope, req.query);
 
-        // Only apply status filter if it's provided and not empty
-        if (status && status.trim() !== "") {
-            filter.status = status;
-        }
+        const { page, limit } = pageParams(req.query);
+        const skip = (page - 1) * limit;
 
         let tasks;
-
-        if (req.user.role === "admin") {
-            tasks = await Task.find(filter).populate("assignedTo", "name email profileImageUrl");
+        if (req.query.sortBy === "priority") {
+            // Mongo would sort the priority enum alphabetically; rank it in the pipeline so
+            // paging stays in the database. _id breaks ties so pages never overlap.
+            const dir = req.query.sortOrder === "asc" ? 1 : -1;
+            const ranked = await Task.aggregate([
+                { $match: filter },
+                { $addFields: { _rank: { $switch: {
+                    branches: Object.entries(PRIORITY_ORDER).map(([name, rank]) => ({ case: { $eq: ["$priority", name] }, then: rank })),
+                    default: 0,
+                } } } },
+                { $sort: { _rank: dir, _id: 1 } },
+                { $skip: skip },
+                { $limit: limit },
+                { $project: { activity: 0, _rank: 0 } },
+            ]);
+            tasks = await Task.populate(ranked, [
+                { path: "assignedTo", select: "name email profileImageUrl" },
+                { path: "project", select: "name" },
+            ]);
         } else {
-            tasks = await Task.find({ ...filter, assignedTo: req.user._id }).populate("assignedTo", "name email profileImageUrl");
+            tasks = await Task.find(filter)
+                .sort({ ...buildSort(req.query), _id: 1 })
+                .skip(skip)
+                .limit(limit)
+                .select("-activity")
+                .populate("assignedTo", "name email profileImageUrl")
+                .populate("project", "name");
         }
 
-        // Add completed todoCheckList count to each task
-        tasks = await Promise.all(
-            tasks.map(async (task) => {
-                const completedCount = task.todoChecklist.filter(item => item.completed).length;
-                return { ...task._doc, completedTodoCount: completedCount };
-            })
+        // Setting `status` per tab would overwrite a status the base filter excludes
+        // (overdue implies "not Completed"), so honour that exclusion instead of counting it.
+        const countByStatus = (status) => (
+            base.status?.$nin?.includes(status) ? Promise.resolve(0) : Task.countDocuments({ ...base, status })
         );
 
-        // Status summary counts
-        const allTasks = await Task.countDocuments(
-            req.user.role === "admin" ? {} : { assignedTo: req.user._id }
-        );
+        const [allTasks, pendingTasks, inProgressTasks, blockedTasks, inReviewTasks, completedTasks, cancelledTasks] = await Promise.all([
+            Task.countDocuments(base),
+            countByStatus("To Do"),
+            countByStatus("In Progress"),
+            countByStatus("Blocked"),
+            countByStatus("In Review"),
+            countByStatus("Completed"),
+            countByStatus("Cancelled"),
+        ]);
 
-        const pendingTasks = await Task.countDocuments({
-            status: "Pending",
-            ...(req.user.role !== "admin" && { assignedTo: req.user._id })
-        });
-
-        const inProgressTasks = await Task.countDocuments({
-            status: "In Progress",
-            ...(req.user.role !== "admin" && { assignedTo: req.user._id })
-        });
-
-        const completedTasks = await Task.countDocuments({
-            status: "Completed",
-            ...(req.user.role !== "admin" && { assignedTo: req.user._id })
-        });
+        const waiting = await waitingForByTask(tasks);
+        // Total matching the current filters + status tab, so the pager knows how many pages exist.
+        const total = filter.status === undefined ? allTasks : await Task.countDocuments(filter);
 
         res.json({
-            tasks,
-            statusSummary: {
-                all: allTasks,
-                pendingTasks,
-                inProgressTasks,
-                completedTasks,
-            },
+            pagination: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) },
+            tasks: tasks.map((task) => ({ ...withCompletedCount(task), waitingFor: waiting.get(String(task._id)) || [] })),
+            statusSummary: { all: allTasks, pendingTasks, inProgressTasks, blockedTasks, inReviewTasks, completedTasks, cancelledTasks },
         });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
     }
 };
 
+const getCategories = async (req, res) => {
+    try {
+        const categories = await Task.distinct("category", await scopeFor(req.user));
+        res.json({ categories: categories.filter(Boolean).sort() });
+    } catch (error) {
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+};
+
+const getAnalytics = async (req, res) => {
+    try {
+        const scope = await scopeFor(req.user);
+        const days = Math.min(Number(req.query.days) || 30, 180);
+        const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+        const now = new Date();
+
+        const groupCount = (field) => Task.aggregate([
+            { $match: scope },
+            { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+            { $sort: { _id: 1 } },
+        ]);
+
+        const [
+            statusGroups,
+            priorityGroups,
+            categoryGroups,
+            trendCreated,
+            trendCompleted,
+            progressAgg,
+            overdueCount,
+            upcoming,
+        ] = await Promise.all([
+            groupCount("status"),
+            groupCount("priority"),
+            Task.aggregate([
+                { $match: scope },
+                {
+                    $group: {
+                        _id: { $ifNull: ["$category", "General"] },
+                        count: { $sum: 1 },
+                        completed: { $sum: { $cond: [{ $eq: ["$status", "Completed"] }, 1, 0] } },
+                        avgProgress: { $avg: "$progress" },
+                    },
+                },
+                { $sort: { count: -1 } },
+            ]),
+            Task.aggregate([
+                { $match: { ...scope, createdAt: { $gte: since } } },
+                { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, count: { $sum: 1 } } },
+            ]),
+            Task.aggregate([
+                { $match: { ...scope, completedAt: { $gte: since } } },
+                { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$completedAt" } }, count: { $sum: 1 } } },
+            ]),
+            Task.aggregate([{ $match: scope }, { $group: { _id: null, avgProgress: { $avg: "$progress" } } }]),
+            Task.countDocuments({ ...scope, status: OPEN, dueDate: { $lt: now } }),
+            Task.find({ ...scope, status: OPEN, dueDate: { $gte: now } })
+                .sort({ dueDate: 1 })
+                .limit(5)
+                .select("title dueDate priority status category progress"),
+        ]);
+
+        const byStatus = statusGroups.map((g) => ({ status: g._id, count: g.count }));
+        const total = byStatus.reduce((sum, g) => sum + g.count, 0);
+        const completed = byStatus.find((g) => g.status === "Completed")?.count || 0;
+
+        // Merge both trend aggregations onto one continuous day axis so gaps render as zero.
+        const createdMap = Object.fromEntries(trendCreated.map((d) => [d._id, d.count]));
+        const completedMap = Object.fromEntries(trendCompleted.map((d) => [d._id, d.count]));
+        const trend = [];
+        for (let i = days - 1; i >= 0; i -= 1) {
+            const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            trend.push({ date, created: createdMap[date] || 0, completed: completedMap[date] || 0 });
+        }
+
+        res.json({
+            totals: {
+                all: total,
+                completed,
+                overdue: overdueCount,
+                completionRate: total ? Math.round((completed / total) * 100) : 0,
+                avgProgress: Math.round(progressAgg[0]?.avgProgress || 0),
+            },
+            byStatus,
+            byPriority: priorityGroups.map((g) => ({ priority: g._id, count: g.count })),
+            byCategory: categoryGroups.map((g) => ({
+                category: g._id,
+                count: g.count,
+                completed: g.completed,
+                avgProgress: Math.round(g.avgProgress || 0),
+            })),
+            trend,
+            upcoming,
+        });
+    } catch (error) {
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+};
 
 const getTaskById = async (req, res) => {
     try {
-
-
-        const task = await Task.findById(req.params.id).populate(
-            "assignedTo", "name email profileImageUrl"
-        );
+        const task = await Task.findById(req.params.id)
+            .populate("assignedTo", "name email profileImageUrl")
+            .populate("comments.user", "name email profileImageUrl")
+            .populate("subtasks.assignee", "name email profileImageUrl")
+            .populate("activity.user", "name profileImageUrl")
+            .populate("blockedBy", "title status")
+            .populate("project", "name status")
+            .populate("department", "name");
 
         if (!task) {
             return res.status(404).json({ message: "Task not found" });
         }
 
-        res.json(task);
+        // Members may only open tasks assigned to them, heads only tasks within
+        // their department - a task id is guessable and the document carries
+        // descriptions, attachments and comments.
+        if (!await canAccessTask(req.user, task)) {
+            return res.status(403).json({ message: "Not authorized to view this task" });
+        }
+
+        // The client shows Approve / Send back from this; the /review route re-checks.
+        const doc = task.toObject();
+        res.json({
+            ...doc,
+            canReview: await canReview(req.user, task),
+            isWatching: (doc.watchers || []).some((id) => String(id) === String(req.user._id)),
+            waitingFor: (doc.blockedBy || []).filter((t) => !["Completed", "Cancelled"].includes(t.status)).map((t) => t.title),
+        });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
     }
 };
 
-
-
 const createTask = async (req, res) => {
     try {
-
         const {
-            title, description, priority,
-            dueDate, assignedTo, attachments,
-            todoChecklist
+            title, description, priority, category,
+            dueDate, assignedTo, attachments, todoChecklist,
+            requiresReview, recurrence, startDate, tags, status,
+            project, department,
         } = req.body;
+        const { body } = req;
 
-        if (!Array.isArray(assignedTo)) {
-            return res.status(400).json({ message: "assigned-to must be an array of user ID's" })
+        if (!String(title || "").trim()) {
+            return res.status(400).json({ message: "Title is required" });
+        }
+        if (priority !== undefined && !PRIORITIES.includes(priority)) {
+            return res.status(400).json({ message: `priority must be one of ${PRIORITIES.join(", ")}` });
+        }
+        if (status !== undefined && !["To Do", "In Progress"].includes(status)) {
+            return res.status(400).json({ message: "A new task can start as To Do or In Progress" });
+        }
+        if (recurrence && recurrence !== "none" && !dueDate) {
+            return res.status(400).json({ message: "A recurring task needs a due date" });
         }
 
+        if (!Array.isArray(assignedTo)) {
+            return res.status(400).json({ message: "assigned-to must be an array of user ID's" });
+        }
+
+        if (recurrence !== undefined && !RECURRENCES.includes(recurrence)) {
+            return res.status(400).json({ message: `recurrence must be one of ${RECURRENCES.join(", ")}` });
+        }
+
+        // Admins assign to anyone; a head only to their own department; a member only to themselves.
+        const selfOnly = req.user.role === "member"
+            && assignedTo.length > 0 && assignedTo.every((id) => String(id) === String(req.user._id));
+        if (!selfOnly && !await canAssignTo(req.user, assignedTo)) {
+            return res.status(403).json({ message: req.user.role === "member"
+                ? "You can only create tasks for yourself"
+                : "You can only assign tasks to members of your own department" });
+        }
+
+        const reminder = body.reminder || { type: "none" };
+        const badReminder = reminderError(reminder);
+        if (badReminder) return res.status(400).json({ message: badReminder });
+        if (reminder.type !== "none" && !dueDate) {
+            return res.status(400).json({ message: "A reminder needs a due date" });
+        }
+
+        const link = await checkLinks(req.user, { project, department });
+        if (link) return res.status(link.status).json({ message: link.message });
+
         const task = await Task.create({
-            title, description, priority,
-            dueDate, assignedTo,
+            project: project || null,
+            department: department || null,
+            reminder,
+            remindAt: computeRemindAt(dueDate, reminder),
+            estimatedMinutes: Number.isInteger(body.estimatedMinutes) && body.estimatedMinutes >= 0 ? body.estimatedMinutes : null,
+            title: title.trim(), description, priority, status,
+            category: category || "General",
+            startDate: startDate || null,
+            tags: normalizeTags(tags),
+            dueDate: dueDate || null, assignedTo,
+            activity: [{ user: req.user._id, type: "created", text: "created the task" }],
             createdBy: req.user._id,
             attachments,
-            todoChecklist: todoChecklist,
-        })
-        res.status(201).json({ message: "Task created successfully", task })
+            todoChecklist,
+            requiresReview: Boolean(requiresReview),
+            recurrence: recurrence || "none",
+        });
 
+        await notify({
+            userIds: assignedTo,
+            actor: req.user,
+            type: "assigned",
+            task: task._id,
+            title: `New task: ${task.title}`,
+            message: `${req.user.name} assigned you "${task.title}"${dueText(task)}.`,
+        });
 
+        res.status(201).json({ message: "Task created successfully", task });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
-
-
     }
-}
+};
 
 const updateTask = async (req, res) => {
     try {
-
         const task = await Task.findById(req.params.id);
 
         if (!task) {
             return res.status(404).json({ message: "Task not found" });
         }
 
-        task.title = req.body.title || task.title;
-        task.description = req.body.description || task.description;
-        task.priority = req.body.priority || task.priority;
-        task.dueDate = req.body.dueDate || task.dueDate;
-        task.todoChecklist = req.body.todoChecklist || task.todoChecklist;
-        task.attachments = req.body.attachments || task.attachments;
+        // The route already limits this to admin/head; a head must additionally
+        // be limited to tasks inside their own department. Without this any
+        // signed-in user could previously edit or reassign any task by id.
+        if (!await canAccessTask(req.user, task)) {
+            return res.status(403).json({ message: "Not authorized to update this task" });
+        }
 
-        if (req.body.assignedTo) {
-            if (!Array.isArray(req.body.assignedTo)) {
-                return res.status(400).json({ message: "assigned-to must be an array of user ID's" })
+        const { body } = req;
+        if (body.priority !== undefined && !PRIORITIES.includes(body.priority)) {
+            return res.status(400).json({ message: `priority must be one of ${PRIORITIES.join(", ")}` });
+        }
+
+        const previousAssignees = (task.assignedTo || []).map(String);
+        const previousPriority = task.priority;
+        const previousDue = task.dueDate ? task.dueDate.getTime() : null;
+        const previousAttachments = (task.attachments || []).length;
+
+        task.title = body.title || task.title;
+        task.description = body.description || task.description;
+        task.priority = body.priority || task.priority;
+        task.category = body.category || task.category;
+        task.todoChecklist = body.todoChecklist || task.todoChecklist;
+        task.attachments = body.attachments || task.attachments;
+        // Dates can be cleared by sending null / "", unlike text fields above.
+        if ("dueDate" in body) task.dueDate = body.dueDate || null;
+        if ("startDate" in body) task.startDate = body.startDate || null;
+        if ("tags" in body) task.tags = normalizeTags(body.tags);
+
+        if (typeof body.requiresReview === "boolean") task.requiresReview = body.requiresReview;
+        if (body.recurrence !== undefined) {
+            if (!RECURRENCES.includes(body.recurrence)) {
+                return res.status(400).json({ message: `recurrence must be one of ${RECURRENCES.join(", ")}` });
             }
-            task.assignedTo = req.body.assignedTo;
+            task.recurrence = body.recurrence;
+        }
+        if (task.recurrence !== "none" && !task.dueDate) {
+            return res.status(400).json({ message: "A recurring task needs a due date" });
+        }
+
+        if (body.assignedTo) {
+            if (!Array.isArray(body.assignedTo)) {
+                return res.status(400).json({ message: "assigned-to must be an array of user ID's" });
+            }
+            // Reassignment must not be a way out of your own department.
+            if (!await canAssignTo(req.user, body.assignedTo)) {
+                return res.status(403).json({ message: "You can only assign tasks to members of your own department" });
+            }
+            task.assignedTo = body.assignedTo;
+        }
+
+        if ("project" in body || "department" in body) {
+            const link = await checkLinks(req.user, {
+                project: "project" in body ? body.project : undefined,
+                department: "department" in body ? body.department : undefined,
+            });
+            if (link) return res.status(link.status).json({ message: link.message });
+            if ("project" in body) task.project = body.project || null;
+            if ("department" in body) task.department = body.department || null;
+        }
+
+        if ("reminder" in body || "dueDate" in body) {
+            if ("reminder" in body) {
+                const badReminder = reminderError(body.reminder);
+                if (badReminder) return res.status(400).json({ message: badReminder });
+                task.reminder = body.reminder;
+            }
+            if (task.reminder?.type && task.reminder.type !== "none" && !task.dueDate) {
+                return res.status(400).json({ message: "A reminder needs a due date" });
+            }
+            // New due date or reminder means a fresh chance to fire.
+            task.remindAt = computeRemindAt(task.dueDate, task.reminder);
+            task.reminderSentAt = null;
+        }
+
+        // Timeline: one line per thing that actually changed.
+        const added = (task.assignedTo || []).map(String).filter((id) => !previousAssignees.includes(id));
+        const removed = previousAssignees.filter((id) => !(task.assignedTo || []).map(String).includes(id));
+        let addedNames = [];
+        if (added.length) {
+            addedNames = (await User.find({ _id: { $in: added } }).select("name").lean()).map((u) => u.name);
+            logActivity(task, req.user, previousAssignees.length ? "reassigned" : "assigned", `assigned the task to ${addedNames.join(", ")}`);
+        }
+        if (task.priority !== previousPriority) {
+            logActivity(task, req.user, "priority", `changed priority: ${previousPriority} → ${task.priority}`);
+        }
+        const currentDue = task.dueDate ? task.dueDate.getTime() : null;
+        if (currentDue !== previousDue) {
+            logActivity(task, req.user, "dueDate", currentDue ? `changed the due date to ${task.dueDate.toDateString()}` : "removed the due date");
+        }
+        if (task.attachments.length > previousAttachments) {
+            logActivity(task, req.user, "attachment", "added an attachment");
         }
 
         const updatedTask = await task.save();
-        res.json({ message: "Task updated successfully", updatedTask })
 
+        const currentAssignees = (updatedTask.assignedTo || []).map(String);
+
+        await notify({
+            userIds: currentAssignees.filter((id) => !previousAssignees.includes(id)),
+            actor: req.user,
+            type: "assigned",
+            task: task._id,
+            title: `New task: ${task.title}`,
+            message: `${req.user.name} assigned you "${task.title}"${dueText(task)}.`,
+        });
+
+        // Whoever was taken off the task hears about it too.
+        await notify({
+            userIds: removed,
+            actor: req.user,
+            type: "reassigned",
+            task: task._id,
+            title: `Reassigned: ${task.title}`,
+            message: `${req.user.name} reassigned "${task.title}"` + (addedNames.length ? ` to ${addedNames.join(", ")}.` : " and it is no longer yours."),
+        });
+
+        await notify({
+            userIds: [...currentAssignees.filter((id) => previousAssignees.includes(id)), ...(task.watchers || [])],
+            actor: req.user,
+            type: "updated",
+            task: task._id,
+            title: `Task updated: ${task.title}`,
+            message: `${req.user.name} updated "${task.title}".`,
+        });
+
+        res.json({ message: "Task updated successfully", updatedTask });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
-
-
     }
-}
+};
 
+/** Recomputes progress + status from the checklist. A finished task that needs sign-off stops at In Review. */
+const syncProgress = (task, { needsReview = false, wasCompleted = false } = {}) => {
+    const total = task.todoChecklist.length;
+    const done = task.todoChecklist.filter((item) => item.completed).length;
+    task.progress = total > 0 ? Math.round((done / total) * 100) : 0;
 
+    if (total > 0 && task.progress === 100) {
+        // Already signed off and still fully checked - a checklist edit that
+        // doesn't drop below 100% must not re-demote it back to In Review.
+        task.status = wasCompleted ? "Completed" : needsReview ? "In Review" : "Completed";
+    } else if (["Blocked", "Cancelled"].includes(task.status)) {
+        // Ticking a box must not silently unblock or un-cancel a task.
+    } else if (task.progress > 0) task.status = "In Progress";
+    else task.status = "To Do";
+
+    task.completedAt = task.status === "Completed" ? (task.completedAt || new Date()) : null;
+};
 
 const updateTaskCheckList = async (req, res) => {
     try {
@@ -386,38 +803,33 @@ const updateTaskCheckList = async (req, res) => {
             return res.status(404).json({ message: "Task not found" });
         }
 
-        // Only allow updates if user is assigned to the task or is an admin
-        if (!task.assignedTo.includes(req.user._id) && req.user.role !== "admin") {
+        if (!await canAccessTask(req.user, task)) {
             return res.status(403).json({ message: "Not authorized to update checklist" });
         }
 
-        // Update the checklist and progress
+        const previousStatus = task.status;
         task.todoChecklist = todoChecklist;
-        const completedCount = task.todoChecklist.filter(item => item.completed).length;
-        const totalItems = task.todoChecklist.length;
-        task.progress = totalItems > 0 ? Math.round((completedCount / totalItems) * 100) : 0;
-
-        // Set the status based on progress
-        if (task.progress === 100) {
-            task.status = "Completed";
-        } else if (task.progress > 0) {
-            task.status = "In Progress";
-        } else {
-            task.status = "Pending";
+        syncProgress(task, {
+            needsReview: task.requiresReview && !await canReview(req.user, task),
+            wasCompleted: previousStatus === "Completed",
+        });
+        if (task.status !== previousStatus && !["To Do", "Blocked", "Cancelled"].includes(task.status)) {
+            const blockers = await openBlockers(task);
+            if (blockers.length) {
+                return res.status(409).json({ message: `Waiting for ${blockers.map((b) => b.title).join(", ")}` });
+            }
         }
-
-        // Save the task with updated checklist and progress
+        logStatusChange(task, previousStatus, req.user);
         await task.save();
 
-        // Fetch the updated task with populated assigned user details
-        const updatedTask = await Task.findById(req.params.id).populate("assignedTo", "name email profileImageUrl");
+        // Ticking boxes is routine; only finishing (or submitting for review) is news.
+        if (["Completed", "In Review"].includes(task.status)) {
+            await afterStatusChange(task, previousStatus, req.user);
+        }
 
-        // Respond with updated task and success message
-        res.json({
-            message: "Task checklist updated",
-            task: updatedTask
-        });
+        const updatedTask = await populateTask(req.params.id);
 
+        res.json({ message: "Task checklist updated", task: updatedTask });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
     }
@@ -431,33 +843,44 @@ const updateTaskStatus = async (req, res) => {
             return res.status(404).json({ message: "Task not found" });
         }
 
-        // Check if the user is assigned to the task or is an admin
-        const isAssigned = task.assignedTo.some(
-            (userId) => userId.toString() === req.user._id.toString()
-        );
-
-        if (!isAssigned && req.user.role !== "admin") {
+        if (!await canAccessTask(req.user, task)) {
             return res.status(403).json({ message: "Not Authorized" });
         }
 
-        // Update the task status
-        task.status = req.body.status;
-
-        // If status is "Completed", mark all checklist items as completed and set progress to 100
-        if (task.status === "Completed") {
-            task.todoChecklist.forEach((item) => {
-                item.completed = true; // Mark each checklist item as completed
-            });
-            task.progress = 100; // Set task progress to 100% when completed
-        } else {
-            // If status isn't "Completed", recalculate the progress based on checklist completion
-            const completedItems = task.todoChecklist.filter(item => item.completed).length;
-            const totalItems = task.todoChecklist.length;
-            task.progress = totalItems ? (completedItems / totalItems) * 100 : 0; // Calculate progress percentage
+        const wanted = req.body.status;
+        if (!REQUESTABLE_STATUSES.includes(wanted)) {
+            return res.status(400).json({ message: `status must be one of ${REQUESTABLE_STATUSES.join(", ")}` });
         }
 
-        // Save the updated task
+        if (["In Progress", "Completed"].includes(wanted) && wanted !== task.status) {
+            const blockers = await openBlockers(task);
+            if (blockers.length) {
+                return res.status(409).json({ message: `Blocked: waiting for ${blockers.map((b) => b.title).join(", ")}` });
+            }
+        }
+
+        const previousStatus = task.status;
+
+        if (wanted === "Completed" && task.status === "Completed") {
+            // Already signed off - re-requesting Completed is a no-op, not a
+            // fresh submission that could get demoted back to In Review.
+        } else if (wanted === "Completed") {
+            markCompleted(task);
+            if (task.requiresReview && !await canReview(req.user, task)) {
+                task.status = "In Review";
+                task.completedAt = null;
+            }
+        } else {
+            task.status = wanted;
+            const total = task.todoChecklist.length;
+            const done = task.todoChecklist.filter((item) => item.completed).length;
+            task.progress = total ? Math.round((done / total) * 100) : 0;
+            task.completedAt = null;
+        }
+
+        logStatusChange(task, previousStatus, req.user);
         const updatedTask = await task.save();
+        await afterStatusChange(task, previousStatus, req.user);
 
         res.json({ message: "Task status updated successfully", updatedTask });
     } catch (error) {
@@ -465,6 +888,140 @@ const updateTaskStatus = async (req, res) => {
     }
 };
 
+/** Approve or send back a task waiting in review. */
+const reviewTask = async (req, res) => {
+    try {
+        const { action } = req.body;
+        if (!["approve", "reject"].includes(action)) {
+            return res.status(400).json({ message: "action must be approve or reject" });
+        }
+
+        const task = await Task.findById(req.params.id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+        if (!await canReview(req.user, task)) {
+            return res.status(403).json({ message: "Not authorized to review this task" });
+        }
+        if (task.status !== "In Review") {
+            return res.status(400).json({ message: "This task is not waiting for review" });
+        }
+
+        if (action === "approve") {
+            markCompleted(task);
+            logActivity(task, req.user, "completed", "approved and completed the task");
+            await task.save();
+            await afterStatusChange(task, "In Review", req.user, { approved: true });
+        } else {
+            const note = String(req.body.note || "").trim().slice(0, 2000);
+            task.status = "In Progress";
+            task.completedAt = null;
+            if (note) task.comments.push({ user: req.user._id, text: note });
+            logActivity(task, req.user, "status", "sent the task back for changes");
+            await task.save();
+
+            await notify({
+                userIds: task.assignedTo,
+                actor: req.user,
+                type: "review",
+                task: task._id,
+                title: `Sent back: ${task.title}`,
+                message: `${req.user.name} sent "${task.title}" back` + (note ? `: ${note}` : "."),
+            });
+        }
+
+        res.json({
+            message: action === "approve" ? "Task approved" : "Task sent back",
+            task: await populateTask(task._id),
+        });
+    } catch (error) {
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+};
+
+const addComment = async (req, res) => {
+    try {
+        const text = (req.body.text || "").trim();
+        if (!text) {
+            return res.status(400).json({ message: "Comment text is required" });
+        }
+
+        const task = await Task.findById(req.params.id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+
+        if (!await canAccessTask(req.user, task)) {
+            return res.status(403).json({ message: "Not authorized to comment on this task" });
+        }
+
+        // @mentions come from the client's picker as ids. Only people who can open this task count:
+        // mentioning someone must never be a way to push a task's title and text to a person who may not see it.
+        const mentioned = [];
+        const wanted = [...new Set((Array.isArray(req.body.mentions) ? req.body.mentions : []).map(String))]
+            .filter((id) => mongoose.isValidObjectId(id) && id !== String(req.user._id)).slice(0, 10);
+        if (wanted.length) {
+            for (const person of await User.find({ _id: { $in: wanted } }).select("role memberships")) {
+                if (await canAccessTask(person, task)) mentioned.push(String(person._id));
+            }
+        }
+
+        task.comments.push({ user: req.user._id, text, mentions: mentioned });
+        logActivity(task, req.user, "comment", "added a comment");
+        await task.save();
+
+        await notify({
+            userIds: mentioned,
+            actor: req.user,
+            type: "mention",
+            task: task._id,
+            title: `${req.user.name} mentioned you on ${task.title}`,
+            message: `${req.user.name}: ${text.slice(0, 140)}`,
+        });
+
+        // Someone who was just @mentioned does not also get the generic "new comment".
+        await notify({
+            userIds: watchersOf(task).filter((id) => !mentioned.includes(String(id))),
+            actor: req.user,
+            type: "comment",
+            task: task._id,
+            title: `New comment on ${task.title}`,
+            message: `${req.user.name}: ${text.slice(0, 140)}`,
+        });
+
+        await task.populate("comments.user", "name email profileImageUrl");
+        res.status(201).json({ message: "Comment added", comments: task.comments });
+    } catch (error) {
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+};
+
+const deleteComment = async (req, res) => {
+    try {
+        const task = await Task.findById(req.params.id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+
+        const comment = task.comments.id(req.params.commentId);
+        if (!comment) {
+            return res.status(404).json({ message: "Comment not found" });
+        }
+
+        // Only the author or an admin may remove a comment.
+        if (comment.user.toString() !== req.user._id.toString() && req.user.role !== "admin") {
+            return res.status(403).json({ message: "Not authorized to delete this comment" });
+        }
+
+        comment.deleteOne();
+        await task.save();
+        await task.populate("comments.user", "name email profileImageUrl");
+
+        res.json({ message: "Comment deleted", comments: task.comments });
+    } catch (error) {
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+};
 
 const deleteTask = async (req, res) => {
     try {
@@ -473,23 +1030,21 @@ const deleteTask = async (req, res) => {
         if (!task) {
             return res.status(404).json({ message: "Task not found" });
         }
+
         await task.deleteOne();
-        res.json({ message: "Task deleted successfully" })
+        res.json({ message: "Task deleted successfully" });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
-
-
     }
-}
-
-
-
-
-
+};
 
 module.exports = {
     getDashboardData, getUserDashboardData,
-    getTasks, getTaskById, createTask, updateTask,
-    updateTaskCheckList, updateTaskStatus,
-    deleteTask
-}
+    getTasks, getTaskById, getCategories, getAnalytics,
+    createTask, updateTask,
+    updateTaskCheckList, updateTaskStatus, reviewTask,
+    addComment, deleteComment,
+    deleteTask,
+    // exported for server/test.smoke.js
+    buildFilters, buildSort, syncProgress, escapeRegex,
+};

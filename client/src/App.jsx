@@ -7,51 +7,114 @@ import DashBoard from './pages/Admin/Dashboard';
 import ManageTasks from './pages/Admin/ManageTasks';
 import CreateTask from './pages/Admin/CreateTask';
 import ManageUsers from './pages/Admin/ManageUsers';
+import ManageDepartments from './pages/Admin/ManageDepartments';
 import UserDashboard from './pages/User/UserDashboard';
 import MyTasks from './pages/User/MyTasks';
 import ViewTaskDetails from './pages/User/ViewTaskDetails';
+import CalendarView from './pages/CalendarView';
+import MyWork from './pages/MyWork';
+import Board from './pages/Board';
+import Reports from './pages/Reports';
+import Projects from './pages/Projects/Projects';
+import ProjectDetail from './pages/Projects/ProjectDetail';
+import Leads from './pages/Sales/Leads';
+import LeadDetail from './pages/Sales/LeadDetail';
+import SalesDashboard from './pages/Sales/SalesDashboard';
+import Analytics from './pages/Analytics';
+import Profile from './pages/Profile';
 import UserProvider, { UserContext } from './context/userContext';
+import { homeFor } from './utils/roles';
+import NotificationProvider from './context/notificationContext';
 import { Toaster } from 'react-hot-toast';
 
 const App = () => {
   return (
     <UserProvider>
-      <div>
-        <Router>
-          <Routes>
-            {/* Public Routes */}
-            <Route path="/login" element={<Login />} />
-            <Route path="/signup" element={<SignUp />} />
+      <NotificationProvider>
+        <div>
+          <Router>
+            <Routes>
+              {/* Public Routes */}
+              <Route path="/login" element={<Login />} />
+              <Route path="/signup" element={<SignUp />} />
 
-            {/* Admin Routes (Protected) */}
-            <Route element={<PrivateRoute allowedRoutes={['admin']} />}>
-              <Route path="/admin/dashboard" element={<DashBoard />} />
-              <Route path="/admin/tasks" element={<ManageTasks />} />
-              <Route path="/admin/create-task" element={<CreateTask />} />
-              <Route path="/admin/users" element={<ManageUsers />} />
-            </Route>
+              {/* Admin Routes (Protected) */}
+              <Route element={<PrivateRoute allowedRoles={['admin']} />}>
+                <Route path="/admin/dashboard" element={<DashBoard />} />
+                <Route path="/admin/tasks" element={<ManageTasks />} />
+                <Route path="/admin/create-task" element={<CreateTask />} />
+                <Route path="/admin/users" element={<ManageUsers />} />
+                <Route path="/admin/departments" element={<ManageDepartments />} />
+              </Route>
 
-            {/* User Routes (Protected) */}
-            <Route element={<PrivateRoute allowedRoutes={['user']} />}>
-              <Route path="/user/dashboard" element={<UserDashboard />} />
-              
-              <Route path="/user/tasks" element={<MyTasks />} />
-              <Route path="/user/task-details/:id" element={<ViewTaskDetails />} />
-            </Route>
-            {/* default path */}
-            <Route path='/' element={<Root />} />
-          </Routes>
-        </Router>
-      </div>
-      <Toaster
-        toastOptions={{
-          className:"",
-          style:{
-            fontSize:"13px",
-            
-          }
-        } }
-      />
+              {/* Reports: admin = company, head = their department. The API refuses members. */}
+              <Route element={<PrivateRoute allowedRoles={['admin', 'head']} />}>
+                <Route path="/reports" element={<Reports />} />
+              </Route>
+
+              {/* Head of Department Routes (Protected).
+                  Same screens as admin - the API scopes every response to the
+                  head's own department. */}
+              <Route element={<PrivateRoute allowedRoles={['head']} />}>
+                <Route path="/head/dashboard" element={<DashBoard />} />
+                <Route path="/head/tasks" element={<ManageTasks />} />
+                <Route path="/head/create-task" element={<CreateTask />} />
+                <Route path="/head/users" element={<ManageUsers />} />
+              </Route>
+
+              {/* Member Routes (Protected) - "member" is the role the API issues */}
+              <Route element={<PrivateRoute allowedRoles={['member']} />}>
+                <Route path="/user/dashboard" element={<UserDashboard />} />
+                <Route path="/user/tasks" element={<MyTasks />} />
+              </Route>
+
+              {/* Any signed-in user - the API scopes the data by role.
+                  Task details stays open to both: notifications and analytics link here. */}
+              <Route element={<PrivateRoute />}>
+                <Route path="/user/task-details/:id" element={<ViewTaskDetails />} />
+                <Route path="/calendar" element={<CalendarView />} />
+                <Route path="/my-work" element={<MyWork />} />
+                <Route path="/board" element={<Board />} />
+                <Route path="/projects" element={<Projects />} />
+                <Route path="/projects/:id" element={<ProjectDetail />} />
+                <Route path="/analytics" element={<Analytics />} />
+                <Route path="/profile" element={<Profile />} />
+              </Route>
+
+              {/* Sales and Leads are granted per department (Department.modules).
+                  This guard is UX only - requireModule on the API enforces it. */}
+              <Route element={<PrivateRoute requiresModule="sales" />}>
+                <Route path="/sales" element={<SalesDashboard />} />
+              </Route>
+              <Route element={<PrivateRoute requiresModule="leads" />}>
+                <Route path="/sales/leads" element={<Leads />} />
+                <Route path="/sales/leads/:id" element={<LeadDetail />} />
+              </Route>
+
+              {/* default path */}
+              <Route path='/' element={<Root />} />
+            </Routes>
+          </Router>
+        </div>
+        <Toaster
+          position="bottom-right"
+          toastOptions={{
+            // Toasts are glass panels too, so a confirmation never looks like it
+            // came from a different application.
+            style: {
+              fontSize: '13px',
+              background: 'color-mix(in srgb, var(--color-hull) 86%, transparent)',
+              color: 'var(--color-beam)',
+              border: '1px solid color-mix(in srgb, var(--color-mist) 22%, transparent)',
+              backdropFilter: 'blur(20px) saturate(140%)',
+              boxShadow: '0 20px 45px -25px rgba(0,0,0,0.95)',
+              borderRadius: '12px',
+            },
+            success: { iconTheme: { primary: '#34d399', secondary: '#070a12' } },
+            error: { iconTheme: { primary: '#fb7185', secondary: '#070a12' } },
+          }}
+        />
+      </NotificationProvider>
     </UserProvider>
 
   );
@@ -68,7 +131,7 @@ const Root = () => {
     return <Navigate to="/login" />
   }
 
-  return user.role === "admin" ? <Navigate to="/admin/dashboard" /> : <Navigate to="/user/dashboard" />
+  return <Navigate to={homeFor(user)} />
 
 
 }
